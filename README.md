@@ -2,6 +2,8 @@
 
 This project exposes an OpenAI compatible API endpoint on your local machine and routes requests through anonymous provider backends; to effectively use ChatGPT and other providers like InceptionLabs for free.
 
+![Screenshot](assets/image.png)
+
 ## Quick Start
 
 1. Create and activate a virtual environment.
