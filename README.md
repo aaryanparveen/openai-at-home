@@ -1,6 +1,6 @@
 # OpenAI at Home
 
-This project exposes an OpenAI compatible API endpoint on your local machine and routes requests through anonymous provider backends; to effectively use ChatGPT and other providers like InceptionLabs for free.
+This project exposes an OpenAI compatible API endpoint on your local machine and routes requests through anonymous provider backends; to effectively use ChatGPT and other providers like InceptionLabs at home.
 
 ![Screenshot](assets/image.png)
 
