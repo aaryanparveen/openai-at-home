@@ -1,4 +1,5 @@
 import uuid
+import json
 from typing import Generator
 from curl_cffi import requests
 
@@ -9,7 +10,8 @@ ALIASES = {"fast": "instant", "thorough": "high"}
 VALID = {"instant", "low", "medium", "high"}
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 BASE_URL = "https://chat.inceptionlabs.ai"
-ENDPOINT = f"{BASE_URL}/api/chat/completions"
+SESSION_ENDPOINT = f"{BASE_URL}/api/session"
+CHAT_ENDPOINT = f"{BASE_URL}/api/chat"
 
 
 class MercuryProvider(Provider):
@@ -40,6 +42,88 @@ class MercuryProvider(Provider):
 
         return session
 
+    def _normalize_effort(self, effort: str) -> str:
+        normalized = ALIASES.get(effort or "medium", effort or "medium")
+        return normalized if normalized in VALID else "medium"
+
+    def _get_session_token(self, session: requests.Session) -> str:
+        resp = session.get(SESSION_ENDPOINT, timeout=30)
+        resp.raise_for_status()
+
+        token = resp.json().get("token")
+        if not token:
+            raise RuntimeError("session token missing in /api/session response")
+
+        return token
+
+    def _build_chat_payload(self, prompt: str, model: str, effort: str) -> dict:
+        message_id = str(uuid.uuid4())
+        return {
+            "id": str(uuid.uuid4()),
+            "model": model,
+            "reasoning_effort": effort,
+            "trigger": "submit-message",
+            "messageId": message_id,
+            "messages": [
+                {
+                    "id": message_id,
+                    "role": "user",
+                    "parts": [{"type": "text", "text": prompt}],
+                }
+            ],
+        }
+
+    def _post_chat(self, session: requests.Session, payload: dict, stream: bool):
+        last_error = ""
+
+        for attempt in range(2):
+            session_token = self._get_session_token(session)
+            resp = session.post(
+                CHAT_ENDPOINT,
+                headers={
+                    "x-session-token": session_token,
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+                json=payload,
+                timeout=180,
+                stream=stream,
+            )
+
+            if resp.status_code in (401, 403):
+                last_error = f"Mercury auth failed with status {resp.status_code}"
+                continue
+
+            if resp.status_code >= 500 and attempt == 0:
+                last_error = f"Mercury upstream transient error {resp.status_code}"
+                continue
+
+            if resp.status_code >= 400:
+                body = (resp.text or "").strip().replace("\n", " ")
+                raise RuntimeError(f"Mercury upstream {resp.status_code}: {body[:500]}")
+
+            return resp
+
+        raise RuntimeError(last_error or "Mercury request failed")
+
+    def _iter_sse_events(self, response):
+        for line in response.iter_lines():
+            if not line:
+                continue
+
+            line_str = line.decode("utf-8", errors="replace").strip()
+            if not line_str.startswith("data:"):
+                continue
+
+            data_str = line_str[5:].strip()
+            if data_str == "[DONE]":
+                break
+
+            try:
+                yield json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
     def _build_prompt(self, messages: list[dict]) -> str:
         formatted_parts = []
         for msg in messages:
@@ -58,106 +142,47 @@ class MercuryProvider(Provider):
 
     def _call_mercury(self, prompt: str, model: str) -> str:
         session = self._create_session()
-        
-        session_id = str(uuid.uuid4())
+        try:
+            # Prime cookies required by the public chat app.
+            session.get(BASE_URL, timeout=30)
 
-        session.get(BASE_URL, timeout=15)
+            effort = self._normalize_effort("medium")
+            payload = self._build_chat_payload(prompt, model, effort)
+            resp = self._post_chat(session, payload, stream=True)
 
-        payload = {
-            "model": model, 
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "reasoning_effort": "medium",
-        }
+            parts: list[str] = []
+            for event in self._iter_sse_events(resp):
+                event_type = event.get("type")
+                if event_type == "text-delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        parts.append(delta)
+                elif event_type == "error":
+                    raise RuntimeError(f"Mercury stream error: {event}")
 
-        resp = session.post(
-            ENDPOINT,
-            headers={"x-guest-session-id": session_id, "Content-Type": "application/json", "Accept": "application/json"},
-            json=payload,
-            timeout=180,
-        )
-
-        if resp.status_code == 403:
+            return "".join(parts)
+        finally:
             session.close()
-            session = self._create_session()
-            session.get(BASE_URL, timeout=15)
-            resp = session.post(
-                ENDPOINT,
-                headers={"x-guest-session-id": session_id, "Content-Type": "application/json", "Accept": "application/json"},
-                json=payload,
-                timeout=180,
-            )
-
-        resp.raise_for_status()
-        raw = resp.json()
-
-        choices = raw.get("choices", [])
-        msg = choices[0].get("message", {}) if choices else {}
-        text = msg.get("content") or raw.get("content", "")
-        
-        session.close()
-        
-        return text
 
     def _stream_mercury(self, prompt: str, model: str) -> Generator[str, None, None]:
         session = self._create_session()
-        session_id = str(uuid.uuid4())
-        session.get(BASE_URL, timeout=15)
+        try:
+            session.get(BASE_URL, timeout=30)
 
-        payload = {
-            "model": model, 
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
-            "reasoning_effort": "medium",
-        }
+            effort = self._normalize_effort("medium")
+            payload = self._build_chat_payload(prompt, model, effort)
+            resp = self._post_chat(session, payload, stream=True)
 
-        resp = session.post(
-            ENDPOINT,
-            headers={"x-guest-session-id": session_id, "Content-Type": "application/json", "Accept": "application/json"},
-            json=payload,
-            timeout=180,
-            stream=True,
-        )
-
-        if resp.status_code == 403:
+            for event in self._iter_sse_events(resp):
+                event_type = event.get("type")
+                if event_type == "text-delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        yield delta
+                elif event_type == "error":
+                    raise RuntimeError(f"Mercury stream error: {event}")
+        finally:
             session.close()
-            session = self._create_session()
-            session.get(BASE_URL, timeout=15)
-            resp = session.post(
-                ENDPOINT,
-                headers={"x-guest-session-id": session_id, "Content-Type": "application/json", "Accept": "application/json"},
-                json=payload,
-                timeout=180,
-                stream=True,
-            )
-
-        resp.raise_for_status()
-
-        import json
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            line_str = line.decode('utf-8')
-            if not line_str.startswith("data: "):
-                continue
-            
-            data_str = line_str[6:]
-            if data_str == "[DONE]":
-                break
-            
-            try:
-                data = json.loads(data_str)
-                choices = data.get("choices", [])
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {})
-                content = delta.get("content")
-                if content:
-                    yield content
-            except json.JSONDecodeError:
-                pass
-                
-        session.close()
 
     def send_message(self, messages: list[dict], model: str = "mercury-2") -> str:
         prompt = self._build_prompt(messages)

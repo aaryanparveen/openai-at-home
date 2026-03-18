@@ -32,6 +32,17 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "parent": None,
         "provider": MercuryProvider,
     },
+    "mercury-2": {
+        "id": "mercury-2",
+        "backend_model": "mercury-2",
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": "openai-at-home",
+        "permission": [],
+        "root": "mercury-2",
+        "parent": None,
+        "provider": MercuryProvider,
+    },
     "openai/gpt-4o": {
         "id": "openai/gpt-4o",
         "backend_model": "gpt-4o",
